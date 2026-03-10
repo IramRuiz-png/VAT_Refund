@@ -1,0 +1,14 @@
+command: ['streamlit', 'run', 'app.py']
+
+env:
+  - name: 'APP_TITLE'
+    value: 'VAT Refund – Lector/Entrenador'
+  - name: 'CATALOG_NAME'
+    value: 'vat_refund'
+  - name: 'SCHEMA_NAME'
+    value: 'default'
+  - name: 'DOCUMENTS_FOLDER'
+    value: 'documents'
+  - name: 'JOB_ID'
+    value: '161750460925382'
+
