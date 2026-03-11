@@ -1,8 +1,15 @@
 import os
 import time
+import io
+import re
+import zipfile
+import mimetypes
+import posixpath
 import streamlit as st
+import json
 from dotenv import load_dotenv, find_dotenv
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import DatabricksError
 
 load_dotenv(find_dotenv(), override=True)
 
@@ -37,18 +44,121 @@ def month_label(mes_es: str, year: int) -> str:
     return f"{mes_es} {year}"
 
 def base_month_path(m_label: str) -> str:
-    return f"/Volumes/{CATALOG}/{SCHEMA}/{DOCS}/{m_label.strip()}/"
+    return posixpath.join("/Volumes", CATALOG, SCHEMA, DOCS, m_label.strip())
 
 def io_paths(m_label: str):
     base = base_month_path(m_label)
-    input_dir = os.path.join(base, "Archivos de Entrada/")
-    output_dir = os.path.join(base, "Archivos de Salida/") 
+    input_dir = posixpath.join(base, "Archivos de Entrada")
+    output_dir = posixpath.join(base, "Archivos de Salida")
     return input_dir, output_dir
+
+
+def _entry_is_dir(entry) -> bool:
+    is_directory = getattr(entry, "is_directory", None)
+    if isinstance(is_directory, bool):
+        return is_directory
+    return (getattr(entry, "path", "") or "").endswith("/")
+
+
+def _entry_name(entry) -> str:
+    name = getattr(entry, "name", None)
+    if name:
+        return name
+    return posixpath.basename((getattr(entry, "path", "") or "").rstrip("/"))
+
+
+def _dedupe_entries(entries):
+    unique = {}
+    for entry in entries:
+        path = (getattr(entry, "path", "") or "").rstrip("/")
+        if not path:
+            continue
+        if path not in unique:
+            unique[path] = entry
+    return list(unique.values())
+
+
+def _date_prefix(file_name: str):
+    match = re.match(r"^(\d{4})_(\d{2})_(\d{2})_", file_name or "")
+    if not match:
+        return None
+    year, month, day = match.groups()
+    return int(year), int(month), int(day)
+
+
+def _filter_latest_visible_entries(entries):
+    visible_entries = [entry for entry in entries if not _entry_name(entry).lower().endswith(".txt")]
+    dated_entries = []
+
+    for entry in visible_entries:
+        file_date = _date_prefix(_entry_name(entry))
+        if file_date is not None:
+            dated_entries.append((file_date, entry))
+
+    if not dated_entries:
+        return sorted(visible_entries, key=lambda entry: _entry_name(entry).lower()), None
+
+    latest_date = max(item[0] for item in dated_entries)
+    latest_entries = [entry for file_date, entry in dated_entries if file_date == latest_date]
+    return sorted(latest_entries, key=lambda entry: _entry_name(entry).lower()), latest_date
+
+
+def _download_file_bytes(w, file_path: str) -> bytes:
+    with w.files.download(file_path).contents as stream:
+        return stream.read()
+
+
+def _list_files_recursive(w, base_dir: str):
+    files = []
+    seen_dirs = set()
+    seen_files = set()
+    pending = [base_dir.rstrip("/")]
+
+    while pending:
+        current_dir = pending.pop()
+        if current_dir in seen_dirs:
+            continue
+        seen_dirs.add(current_dir)
+
+        for entry in _dedupe_entries(list(w.files.list_directory_contents(current_dir))):
+            entry_path = (getattr(entry, "path", "") or "").rstrip("/")
+            if not entry_path:
+                continue
+
+            if _entry_is_dir(entry):
+                pending.append(entry_path)
+            elif entry_path not in seen_files:
+                seen_files.add(entry_path)
+                files.append(entry)
+
+    return sorted(files, key=lambda item: (getattr(item, "path", "") or "").lower())
+
+
+def _build_zip_bytes(w, base_dir: str, file_entries):
+    zipped = io.BytesIO()
+    failures = []
+
+    with zipfile.ZipFile(zipped, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in file_entries:
+            remote_path = (getattr(f, "path", "") or "").rstrip("/")
+            if not remote_path:
+                continue
+            rel_name = posixpath.relpath(remote_path, start=base_dir)
+            if rel_name in (".", ""):
+                rel_name = _entry_name(f)
+            try:
+                zf.writestr(rel_name, _download_file_bytes(w, remote_path))
+            except Exception as err:
+                failures.append((remote_path, str(err)))
+
+    zipped.seek(0)
+    return zipped.getvalue(), failures, len(file_entries)
 
 
 # Subida de archivos a Volumen Databricks
 def upload_to_databricks_volume(local_file, dbx_path):
     w = _workspace_client()
+    w.files.create_directory(posixpath.dirname(dbx_path))
     with open(local_file, "rb") as f:
         w.files.upload(dbx_path, f, overwrite=True)
 
@@ -65,10 +175,28 @@ def _workspace_client():
 
 # ---------- Jobs ----------
 
+def _enum_value(value):
+    return value.value if hasattr(value, "value") else str(value) if value is not None else None
+
+
+def _try_parse_json(text):
+    if text is None:
+        return None
+    if isinstance(text, (dict, list)):
+        return text
+    if not isinstance(text, str):
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def run_job_and_wait(month_label: str):
     if JOB_ID_INT is None:
         raise RuntimeError("JOB_ID no configurado o inválido (.env).")
 
+    run_id = None
     try:
         w = _workspace_client()
         run = w.jobs.run_now(
@@ -81,10 +209,49 @@ def run_job_and_wait(month_label: str):
                 "model_name": "vat_refund_agent",
             },
         )
-        result = run.result()
-        return result.run_id
+
+        run_id = run.run_id
+        while True:
+            run_state = w.jobs.get_run(run_id)
+            life_cycle = _enum_value(getattr(run_state.state, "life_cycle_state", None))
+            if life_cycle in ("TERMINATED", "INTERNAL_ERROR", "SKIPPED"):
+                break
+            time.sleep(5)
+
+        result_state = _enum_value(getattr(run_state.state, "result_state", None))
+        state_message = getattr(run_state.state, "state_message", None)
+
+        if result_state == "SUCCESS":
+            metrics = None
+            try:
+                output = w.jobs.get_run_output(run_id)
+                notebook_output = getattr(output, "notebook_output", None)
+                raw_result = getattr(notebook_output, "result", None) if notebook_output else None
+                parsed = _try_parse_json(raw_result)
+                if isinstance(parsed, dict):
+                    metrics = parsed.get("metrics", parsed)
+                elif parsed is not None:
+                    metrics = parsed
+                else:
+                    metrics = raw_result
+            except Exception:
+                metrics = None
+
+            return run_id, metrics
+
+        parsed_error = _try_parse_json(state_message)
+        if parsed_error is not None:
+            details = json.dumps(parsed_error, ensure_ascii=False)
+        else:
+            details = state_message or "Sin detalles"
+
+        raise RuntimeError(
+            f"Job falló. run_id={run_id} | life_cycle={life_cycle} | result_state={result_state} | detalle={details}"
+        )
+    except DatabricksError as dbx_err:
+        raise RuntimeError(f"Error específico de Databricks (run_id={run_id}): {dbx_err}")
     except Exception as e:
-        raise RuntimeError(f"Error al autenticar o ejecutar el Job. Detalle: {e}")
+        raise RuntimeError(f"Error al autenticar o ejecutar el Job (run_id={run_id}): {e}")
 
 # ---------- Streamlit UI ----------
 
@@ -161,7 +328,7 @@ with tab1:
                 with tempfile.NamedTemporaryFile(delete=False) as tmp:
                     tmp.write(f.getbuffer())
                     tmp.flush()
-                    dbx_dest = os.path.join(in_path, f.name)
+                    dbx_dest = posixpath.join(in_path, f.name)
                     upload_to_databricks_volume(tmp.name, dbx_dest)
                     subidos += 1
 
@@ -170,9 +337,15 @@ with tab1:
                 st.write(f" Subidos {subidos} archivo(s) a Databricks Volume.")
                 st.write(" Lanzando Job…")
                 start = time.time()
-                run_id = run_job_and_wait(m_label)
+                run_id, metrics = run_job_and_wait(m_label)
                 elapsed = time.time() - start
                 st.write(f" Job terminado. run_id = `{run_id}` en {elapsed:,.1f}s.")
+                if metrics is not None:
+                    if isinstance(metrics, (dict, list)):
+                        st.write(" Métricas / salida del notebook:")
+                        st.json(metrics)
+                    else:
+                        st.write(f" Salida notebook: {metrics}")
                 status.update(label="Proceso finalizado", state="complete")
 
             st.success("Listo. Ve a la pestaña Resultados para descargar los archivos de salida.")
@@ -192,25 +365,183 @@ with tab2:
     m_label2 = month_label(mes2, year2)
     _, out_path2 = io_paths(m_label2)
 
-    if st.button("Listar outputs", use_container_width=True):
+    # Estado de navegación y cache de descargas
+    if "current_path" not in st.session_state:
+        st.session_state["current_path"] = None
+    if "download_cache_path" not in st.session_state:
+        st.session_state["download_cache_path"] = None
+    if "download_cache_items" not in st.session_state:
+        st.session_state["download_cache_items"] = []
+    if "download_cache_failures" not in st.session_state:
+        st.session_state["download_cache_failures"] = []
+    if "zip_cache_path" not in st.session_state:
+        st.session_state["zip_cache_path"] = None
+    if "zip_cache_data" not in st.session_state:
+        st.session_state["zip_cache_data"] = None
+    if "zip_cache_failures" not in st.session_state:
+        st.session_state["zip_cache_failures"] = []
+    if "zip_cache_total_files" not in st.session_state:
+        st.session_state["zip_cache_total_files"] = 0
+
+    # Si el usuario cambia mes/año, limpiar navegación y cache
+    if "last_out_path" not in st.session_state or st.session_state["last_out_path"] != out_path2:
+        st.session_state["current_path"] = None
+        st.session_state["last_out_path"] = out_path2
+        st.session_state["download_cache_path"] = None
+        st.session_state["download_cache_items"] = []
+        st.session_state["download_cache_failures"] = []
+        st.session_state["zip_cache_path"] = None
+        st.session_state["zip_cache_data"] = None
+        st.session_state["zip_cache_failures"] = []
+        st.session_state["zip_cache_total_files"] = 0
+
+    st.markdown("**Navega y descarga archivos de salida:**")
+    buscar = st.button("Buscar", use_container_width=True)
+    w = _workspace_client()
+
+    # Solo mostrar resultados tras buscar
+    if buscar or st.session_state["current_path"]:
+        # Inicializar navegación si es la primera vez
+        if st.session_state["current_path"] is None:
+            st.session_state["current_path"] = out_path2
+
+        # Botón para resetear navegación
+        if st.button("Ir a carpeta raíz", use_container_width=True, key="reset_nav"):
+            st.session_state["current_path"] = out_path2
+            st.session_state["download_cache_path"] = None
+            st.session_state["download_cache_items"] = []
+            st.session_state["download_cache_failures"] = []
+            st.session_state["zip_cache_path"] = None
+            st.session_state["zip_cache_data"] = None
+            st.session_state["zip_cache_failures"] = []
+            st.session_state["zip_cache_total_files"] = 0
+
+        current_path = st.session_state["current_path"]
+
+        # Si cambió ruta, invalidar cache para evitar duplicados o datos viejos
+        if st.session_state["download_cache_path"] != current_path:
+            st.session_state["download_cache_items"] = []
+            st.session_state["download_cache_failures"] = []
+        if st.session_state["zip_cache_path"] != current_path:
+            st.session_state["zip_cache_data"] = None
+            st.session_state["zip_cache_failures"] = []
+            st.session_state["zip_cache_total_files"] = 0
+
         try:
-            w = _workspace_client()
-            # Listar archivos en el volume de Databricks
-            files_out = w.files.list(out_path2)
-            files_out = [f for f in files_out if not f.is_dir]
-            if not files_out:
-                st.warning("No hay archivos en output/ todavía.")
+            entries = _dedupe_entries(list(w.files.list_directory_contents(current_path)))
+            dirs = sorted([e for e in entries if _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
+            all_files = sorted([e for e in entries if not _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
+            files, latest_date = _filter_latest_visible_entries(all_files)
+
+            st.caption(f"Ruta actual: {current_path}")
+            st.caption(f"Carpetas: {len(dirs)} | Documentos visibles: {len(files)}")
+            if latest_date is not None:
+                st.caption(
+                    "Fecha más reciente detectada: "
+                    f"{latest_date[0]:04d}_{latest_date[1]:02d}_{latest_date[2]:02d}"
+                )
+
+            if current_path != out_path2:
+                parent_path = posixpath.dirname(current_path.rstrip("/"))
+                if parent_path.startswith(out_path2):
+                    if st.button("Subir un nivel", use_container_width=True, key="up_nav"):
+                        st.session_state["current_path"] = parent_path
+                        st.rerun()
+
+            if not dirs and not all_files:
+                st.warning("No hay archivos ni carpetas en esta ruta.")
             else:
-                for f in files_out:
-                    dbx_fp = os.path.join(out_path2, f.name)
-                    # Descargar el archivo a memoria y ofrecerlo
-                    file_bytes = w.files.download(dbx_fp).read()
+                # Mostrar carpetas
+                for d in dirs:
+                    dir_name = _entry_name(d)
+                    if st.button(f" {dir_name}", key=f"dir_{d.path}", use_container_width=True):
+                        st.session_state["current_path"] = d.path
+                        st.rerun()
+
+                if not files and all_files:
+                    st.info("Se ocultaron archivos TXT; se muestran documentos de la fecha más reciente.")
+
+                # Lista de archivos visibles en esta carpeta (rápido, sin descargar todavía)
+                for f in files:
+                    st.caption(f"- {_entry_name(f)}")
+
+                load_all_now = False
+                build_zip_now = False
+                if files:
+                    col_load, col_zip = st.columns(2)
+                    load_all_now = col_load.button("Cargar todos (misma carpeta)", use_container_width=True, key="load_all_now")
+                    build_zip_now = col_zip.button("Preparar ZIP de documentos", use_container_width=True, key="build_zip_now")
+
+                if load_all_now:
+                    loaded = []
+                    failures = []
+                    progress = st.progress(0)
+                    status = st.empty()
+                    total = len(files)
+                    for idx, f in enumerate(files, start=1):
+                        fpath = (getattr(f, "path", "") or "").rstrip("/")
+                        fname = _entry_name(f)
+                        status.caption(f"Cargando {idx}/{total}: {fname}")
+                        try:
+                            data = _download_file_bytes(w, fpath)
+                            mime, _ = mimetypes.guess_type(fname)
+                            loaded.append(
+                                {
+                                    "path": fpath,
+                                    "name": fname,
+                                    "bytes": data,
+                                    "mime": mime or "application/octet-stream",
+                                }
+                            )
+                        except Exception as err:
+                            failures.append((fname, str(err)))
+                        progress.progress(int((idx / total) * 100))
+
+                    st.session_state["download_cache_path"] = current_path
+                    st.session_state["download_cache_items"] = loaded
+                    st.session_state["download_cache_failures"] = failures
+
+                if build_zip_now:
+                    with st.spinner("Preparando ZIP con los documentos visibles..."):
+                        zip_bytes, zip_failures, zip_total_files = _build_zip_bytes(w, current_path, files)
+                    st.session_state["zip_cache_path"] = current_path
+                    st.session_state["zip_cache_data"] = zip_bytes
+                    st.session_state["zip_cache_failures"] = zip_failures
+                    st.session_state["zip_cache_total_files"] = zip_total_files
+
+                # Mostrar descargas individuales solo cuando ya estén todas cargadas
+                if st.session_state["download_cache_path"] == current_path and st.session_state["download_cache_items"]:
+                    st.success(f"Archivos cargados para descarga: {len(st.session_state['download_cache_items'])}")
+                    for item in st.session_state["download_cache_items"]:
+                        st.download_button(
+                            label=f"⬇Descargar {item['name']}",
+                            data=item["bytes"],
+                            file_name=item["name"],
+                            mime=item["mime"],
+                            key=f"dl_{item['path']}",
+                            use_container_width=True,
+                        )
+
+                if st.session_state["download_cache_path"] == current_path and st.session_state["download_cache_failures"]:
+                    st.warning(f"No se pudieron cargar {len(st.session_state['download_cache_failures'])} archivo(s).")
+                    for fname, err in st.session_state["download_cache_failures"]:
+                        st.caption(f"- {fname}: {err}")
+
+                if st.session_state["zip_cache_path"] == current_path and st.session_state["zip_cache_data"]:
+                    zip_filename = f"outputs_{mes2}_{year2}_{posixpath.basename(current_path.rstrip('/')) or 'carpeta'}.zip"
+                    st.success(f"ZIP listo con {st.session_state['zip_cache_total_files']} documento(s).")
                     st.download_button(
-                        label=f"⬇Descargar {f.name}",
-                        data=file_bytes,
-                        file_name=f.name,
-                        mime="application/octet-stream",
-                        use_container_width=True
+                        label="⬇Descargar documentos visibles en ZIP",
+                        data=st.session_state["zip_cache_data"],
+                        file_name=zip_filename,
+                        mime="application/zip",
+                        key="dl_zip_all",
+                        use_container_width=True,
                     )
+
+                if st.session_state["zip_cache_path"] == current_path and st.session_state["zip_cache_failures"]:
+                    st.warning(f"No se pudieron incluir {len(st.session_state['zip_cache_failures'])} archivo(s) en el ZIP.")
+                    for fpath, err in st.session_state["zip_cache_failures"]:
+                        st.caption(f"- {fpath}: {err}")
         except Exception as e:
             st.error(f"No se pudieron listar/descargar outputs: {e}")
