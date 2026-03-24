@@ -5,6 +5,8 @@ import re
 import zipfile
 import mimetypes
 import posixpath
+import unicodedata
+from types import SimpleNamespace
 import streamlit as st
 import json
 from dotenv import load_dotenv, find_dotenv
@@ -55,8 +57,17 @@ def io_paths(m_label: str):
 
 def _entry_is_dir(entry) -> bool:
     is_directory = getattr(entry, "is_directory", None)
-    if isinstance(is_directory, bool):
-        return is_directory
+    if is_directory is not None:
+        if isinstance(is_directory, bool):
+            return is_directory
+        # Algunas versiones del SDK pueden devolver string/enum.
+        return str(is_directory).strip().lower() in ("true", "1", "directory", "dir")
+
+    # Heuristica para entradas sin flag explicito: en Databricks, carpetas suelen no tener file_size.
+    file_size = getattr(entry, "file_size", None)
+    if file_size is None:
+        return True
+
     return (getattr(entry, "path", "") or "").endswith("/")
 
 
@@ -65,6 +76,14 @@ def _entry_name(entry) -> str:
     if name:
         return name
     return posixpath.basename((getattr(entry, "path", "") or "").rstrip("/"))
+
+
+def _normalize_text(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", normalized).strip().lower()
 
 
 def _dedupe_entries(entries):
@@ -79,11 +98,16 @@ def _dedupe_entries(entries):
 
 
 def _date_prefix(file_name: str):
-    match = re.match(r"^(\d{4})_(\d{2})_(\d{2})_", file_name or "")
+    match = re.match(r"^\s*(\d{4})[._-](\d{2})[._-](\d{2})(?:\b|\s*[-_])", file_name or "")
     if not match:
         return None
     year, month, day = match.groups()
-    return int(year), int(month), int(day)
+    y, m, d = int(year), int(month), int(day)
+    if m < 1 or m > 12:
+        return None
+    if d < 1 or d > 31:
+        return None
+    return y, m, d
 
 
 def _filter_latest_visible_entries(entries):
@@ -100,6 +124,23 @@ def _filter_latest_visible_entries(entries):
     latest_date = max(item[0] for item in dated_entries)
     latest_entries = [entry for file_date, entry in dated_entries if file_date == latest_date]
     return sorted(latest_entries, key=lambda entry: _entry_name(entry).lower()), latest_date
+
+
+def _filter_latest_dated_dirs(entries):
+    sorted_dirs = sorted(entries, key=lambda entry: _entry_name(entry).lower())
+    dated_dirs = []
+
+    for entry in sorted_dirs:
+        dir_date = _date_prefix(_entry_name(entry))
+        if dir_date is not None:
+            dated_dirs.append((dir_date, entry))
+
+    if not dated_dirs:
+        return sorted_dirs, None
+
+    latest_date = max(item[0] for item in dated_dirs)
+    latest_dirs = [entry for dir_date, entry in dated_dirs if dir_date == latest_date]
+    return sorted(latest_dirs, key=lambda entry: _entry_name(entry).lower()), latest_date
 
 
 # ---------- Validación de archivos según 8 patrones estrictos ----------
@@ -241,6 +282,21 @@ def _download_file_bytes(w, file_path: str) -> bytes:
         return stream.read()
 
 
+def _directory_exists(w, directory_path: str) -> bool:
+    try:
+        list(w.files.list_directory_contents(directory_path.rstrip("/")))
+        return True
+    except Exception:
+        return False
+
+
+def _first_existing_dir_path(w, candidates):
+    for candidate in candidates:
+        if _directory_exists(w, candidate):
+            return candidate.rstrip("/")
+    return None
+
+
 def _list_files_recursive(w, base_dir: str):
     files = []
     seen_dirs = set()
@@ -289,8 +345,13 @@ def _build_zip_bytes(w, base_dir: str, file_entries):
 
 
 def render_volume_browser(section_key: str, root_path: str, mes: str, year: int, zip_prefix: str, not_found_label: str):
+    simple_inputs_mode = section_key == "inputs"
     current_key = f"{section_key}_current_path"
     last_root_key = f"{section_key}_last_root"
+    nav_history_key = f"{section_key}_nav_history"
+    nav_index_key = f"{section_key}_nav_index"
+    dir_cursor_path_key = f"{section_key}_dir_cursor_path"
+    dir_cursor_index_key = f"{section_key}_dir_cursor_index"
     download_cache_path_key = f"{section_key}_download_cache_path"
     download_cache_items_key = f"{section_key}_download_cache_items"
     download_cache_failures_key = f"{section_key}_download_cache_failures"
@@ -301,6 +362,14 @@ def render_volume_browser(section_key: str, root_path: str, mes: str, year: int,
 
     if current_key not in st.session_state:
         st.session_state[current_key] = None
+    if nav_history_key not in st.session_state:
+        st.session_state[nav_history_key] = []
+    if nav_index_key not in st.session_state:
+        st.session_state[nav_index_key] = -1
+    if dir_cursor_path_key not in st.session_state:
+        st.session_state[dir_cursor_path_key] = None
+    if dir_cursor_index_key not in st.session_state:
+        st.session_state[dir_cursor_index_key] = 0
     if download_cache_path_key not in st.session_state:
         st.session_state[download_cache_path_key] = None
     if download_cache_items_key not in st.session_state:
@@ -319,6 +388,10 @@ def render_volume_browser(section_key: str, root_path: str, mes: str, year: int,
     if last_root_key not in st.session_state or st.session_state[last_root_key] != root_path:
         st.session_state[current_key] = None
         st.session_state[last_root_key] = root_path
+        st.session_state[nav_history_key] = []
+        st.session_state[nav_index_key] = -1
+        st.session_state[dir_cursor_path_key] = None
+        st.session_state[dir_cursor_index_key] = 0
         st.session_state[download_cache_path_key] = None
         st.session_state[download_cache_items_key] = []
         st.session_state[download_cache_failures_key] = []
@@ -332,11 +405,11 @@ def render_volume_browser(section_key: str, root_path: str, mes: str, year: int,
     w = _workspace_client()
 
     if buscar or st.session_state[current_key]:
-        if st.session_state[current_key] is None:
+        if buscar:
+            # Al buscar, reinicia siempre en la raiz del periodo seleccionado.
             st.session_state[current_key] = root_path
-
-        if st.button("Ir a carpeta raíz", use_container_width=True, key=f"{section_key}_reset_nav"):
-            st.session_state[current_key] = root_path
+            st.session_state[nav_history_key] = [root_path]
+            st.session_state[nav_index_key] = 0
             st.session_state[download_cache_path_key] = None
             st.session_state[download_cache_items_key] = []
             st.session_state[download_cache_failures_key] = []
@@ -345,7 +418,37 @@ def render_volume_browser(section_key: str, root_path: str, mes: str, year: int,
             st.session_state[zip_cache_failures_key] = []
             st.session_state[zip_cache_total_key] = 0
 
+        if st.session_state[current_key] is None:
+            st.session_state[current_key] = root_path
+            st.session_state[nav_history_key] = [root_path]
+            st.session_state[nav_index_key] = 0
+
+        if not simple_inputs_mode:
+            nav_history = st.session_state[nav_history_key]
+            nav_index = st.session_state[nav_index_key]
+
+            if not nav_history:
+                st.session_state[nav_history_key] = [st.session_state[current_key]]
+                st.session_state[nav_index_key] = 0
+                nav_history = st.session_state[nav_history_key]
+                nav_index = st.session_state[nav_index_key]
+
+            go_back = False
+            if st.session_state[current_key] != root_path:
+                go_back = st.button(
+                    "<-",
+                    use_container_width=True,
+                    key=f"{section_key}_nav_back",
+                    disabled=nav_index <= 0,
+                )
+
+            if go_back and nav_index > 0:
+                st.session_state[nav_index_key] = nav_index - 1
+                st.session_state[current_key] = st.session_state[nav_history_key][st.session_state[nav_index_key]]
+                st.rerun()
+
         current_path = st.session_state[current_key]
+        route_display_path = current_path
 
         if st.session_state[download_cache_path_key] != current_path:
             st.session_state[download_cache_items_key] = []
@@ -357,33 +460,121 @@ def render_volume_browser(section_key: str, root_path: str, mes: str, year: int,
 
         try:
             entries = _dedupe_entries(list(w.files.list_directory_contents(current_path)))
-            dirs = sorted([e for e in entries if _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
+            dirs_all = sorted([e for e in entries if _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
+            dirs, latest_dir_date = _filter_latest_dated_dirs(dirs_all)
             all_files = sorted([e for e in entries if not _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
             files, latest_date = _filter_latest_visible_entries(all_files)
 
-            st.caption(f"Ruta actual: {current_path}")
-            st.caption(f"Carpetas: {len(dirs)} | Documentos visibles: {len(files)}")
+            if section_key == "outputs":
+                # En Resultados queremos ver todas las carpetas con fechas (no solo la mas reciente).
+                dirs = dirs_all
+                latest_dir_date = None
+
+            if section_key == "outputs" and current_path == root_path:
+                salida_path = _first_existing_dir_path(
+                    w,
+                    [
+                        posixpath.join(root_path, "Archivos de Salida"),
+                        posixpath.join(root_path, "archivos de salida"),
+                    ],
+                ) or posixpath.join(root_path, "Archivos de Salida")
+                validaciones_path = _first_existing_dir_path(
+                    w,
+                    [
+                        posixpath.join(root_path, "Validaciones"),
+                        posixpath.join(root_path, "validaciones"),
+                    ],
+                ) or posixpath.join(root_path, "validaciones")
+
+                route_display_path = validaciones_path
+
+                dirs = [
+                    SimpleNamespace(name="Archivos de Salida", path=salida_path, is_directory=True),
+                    SimpleNamespace(name="Validaciones", path=validaciones_path, is_directory=True),
+                ]
+                latest_dir_date = None
+
+            if simple_inputs_mode and dirs:
+                # En Entradas: mostrar automaticamente archivos de la carpeta con fecha mas reciente.
+                selected_dir = dirs[0]
+                selected_path = (getattr(selected_dir, "path", "") or "").rstrip("/")
+                if selected_path:
+                    current_path = selected_path
+                    st.session_state[current_key] = selected_path
+                    entries = _dedupe_entries(list(w.files.list_directory_contents(current_path)))
+                    dirs_all = sorted([e for e in entries if _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
+                    dirs, latest_dir_date = _filter_latest_dated_dirs(dirs_all)
+                    all_files = sorted([e for e in entries if not _entry_is_dir(e)], key=lambda entry: _entry_name(entry).lower())
+                    files, latest_date = _filter_latest_visible_entries(all_files)
+
+            if st.session_state[dir_cursor_path_key] != current_path:
+                st.session_state[dir_cursor_path_key] = current_path
+                st.session_state[dir_cursor_index_key] = 0
+
+            if dirs:
+                max_dir_idx = len(dirs) - 1
+                st.session_state[dir_cursor_index_key] = max(0, min(st.session_state[dir_cursor_index_key], max_dir_idx))
+
+            st.caption(f"Ruta actual: {route_display_path}")
+            if simple_inputs_mode:
+                st.caption(f"Documentos visibles: {len(files)}")
+            else:
+                st.caption(f"Carpetas: {len(dirs)} | Documentos visibles: {len(files)}")
+            if latest_dir_date is not None:
+                st.caption(
+                    "Carpetas con fecha mas reciente: "
+                    f"{latest_dir_date[0]:04d}_{latest_dir_date[1]:02d}_{latest_dir_date[2]:02d}"
+                )
             if latest_date is not None:
                 st.caption(
                     "Fecha más reciente detectada: "
                     f"{latest_date[0]:04d}_{latest_date[1]:02d}_{latest_date[2]:02d}"
                 )
 
-            if current_path != root_path:
+            if (not simple_inputs_mode) and section_key != "outputs" and current_path != root_path:
                 parent_path = posixpath.dirname(current_path.rstrip("/"))
                 if parent_path.startswith(root_path):
                     if st.button("Subir un nivel", use_container_width=True, key=f"{section_key}_up_nav"):
+                        history = st.session_state[nav_history_key]
+                        idx = st.session_state[nav_index_key]
+                        if idx < len(history) - 1:
+                            history = history[: idx + 1]
+                        if not history or history[-1] != parent_path:
+                            history.append(parent_path)
+                            idx = len(history) - 1
+                        st.session_state[nav_history_key] = history
+                        st.session_state[nav_index_key] = idx
                         st.session_state[current_key] = parent_path
                         st.rerun()
 
             if not dirs and not all_files:
                 st.warning("No hay archivos ni carpetas en esta ruta.")
             else:
-                for d in dirs:
-                    dir_name = _entry_name(d)
-                    if st.button(f" {dir_name}", key=f"{section_key}_dir_{d.path}", use_container_width=True):
-                        st.session_state[current_key] = d.path
-                        st.rerun()
+                if (not simple_inputs_mode) and dirs:
+                    st.markdown("**Carpetas disponibles:**")
+                    for d in dirs:
+                        dir_name = _entry_name(d)
+                        dir_path = (getattr(d, "path", "") or "").rstrip("/")
+                        button_label = f"[DIR] {dir_name}"
+                        btn_key = f"{section_key}_dir_open_{dir_path.replace('/', '_')}"
+                        if st.button(button_label, key=btn_key, use_container_width=True):
+                            target_path = dir_path
+                            if not target_path:
+                                continue
+                            if not _directory_exists(w, target_path):
+                                st.warning(f"No se encontró la carpeta: {target_path}")
+                                continue
+                            history = st.session_state[nav_history_key]
+                            idx = st.session_state[nav_index_key]
+                            if idx < len(history) - 1:
+                                history = history[: idx + 1]
+                            if not history or history[-1] != target_path:
+                                history.append(target_path)
+                                idx = len(history) - 1
+                            st.session_state[nav_history_key] = history
+                            st.session_state[nav_index_key] = idx
+                            st.session_state[current_key] = target_path
+                            st.rerun()
 
                 if not files and all_files:
                     st.info("Se ocultaron archivos TXT; se muestran documentos de la fecha más reciente.")
@@ -477,6 +668,10 @@ def render_volume_browser(section_key: str, root_path: str, mes: str, year: int,
                     for fpath, err in st.session_state[zip_cache_failures_key]:
                         st.caption(f"- {fpath}: {err}")
         except Exception as e:
+            if section_key == "outputs" and "not found" in str(e).lower() and current_path != root_path:
+                st.session_state[current_key] = root_path
+                st.warning("La carpeta seleccionada ya no existe. Regresamos a la raíz de Resultados.")
+                st.rerun()
             st.error(f"No se pudieron listar/descargar {not_found_label}: {e}")
 
 
@@ -643,9 +838,7 @@ Aquí ves y descargas los **archivos que ya fueron subidos** para un mes/año.
 
 1. Elige **Mes** y **Año**.
 2. Clic en **Buscar**.
-3. Navega las carpetas haciendo clic en ellas.  
-   - **"Subir un nivel"** → regresa a la carpeta anterior.  
-   - **"Ir a carpeta raíz"** → regresa al inicio.
+3. La app muestra automaticamente los documentos de la carpeta con fecha mas reciente.
 4. Una vez dentro de la carpeta con los archivos:  
    - **"Cargar todos"** → carga los archivos para descarga uno a uno.  
    - **"Preparar ZIP"** → empaqueta todo en un solo .zip descargable.
@@ -671,11 +864,12 @@ Aquí subes archivos nuevos y lanzas el proceso.
 
 ###  Pestaña: Resultados
 
-Aquí descargas los **archivos generados por el proceso**. Funciona igual que Entradas:
+Aquí descargas los **archivos generados por el proceso**. Desde la raiz del mes puedes entrar a **Archivos de Salida** y **Validaciones**.
 
 1. Elige **Mes** y **Año** → clic en **Buscar**.
-2. Navega las carpetas y usa **"Cargar todos"** o **"Preparar ZIP"**.
-3. Descarga con el botón que aparece.
+2. Verás de inmediato solo las carpetas **Archivos de Salida** y **Validaciones**.
+3. Usa **<-** para retroceder cuando ya entraste a una carpeta.
+4. Descarga con el botón que aparece.
 
 >  Si acabas de procesar, espera unos segundos antes de buscar.
 
@@ -766,12 +960,12 @@ with tab1:
                 archivos_inválidos.append((f.name, mensaje))
         
         if archivos_inválidos:
-            st.warning("⚠️ Los siguientes archivos NO cumplen con los patrones requeridos y NO serán subidos:")
+            st.warning(" Los siguientes archivos NO cumplen con los patrones requeridos y NO serán subidos:")
             for nombre, msg in archivos_inválidos:
                 st.code(f"{nombre}\n→ {msg}", language=None)
         
         if not archivos_válidos:
-            st.error("❌ Ninguno de los archivos subidos cumple con los patrones requeridos.")
+            st.error(" Ninguno de los archivos subidos cumple con los patrones requeridos.")
             st.stop()
         
         if archivos_inválidos:
@@ -821,7 +1015,7 @@ with tab2:
     with colY2:
         year2 = st.number_input("Año", min_value=YEAR_MIN, max_value=YEAR_MAX, value=2025, step=1, key="y2")
     m_label2 = month_label(mes2, year2)
-    _, out_path2 = io_paths(m_label2)
+    out_path2 = base_month_path(m_label2)
     render_volume_browser(
         section_key="outputs",
         root_path=out_path2,
